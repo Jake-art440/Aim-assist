@@ -1,0 +1,627 @@
+--[[
+	AimAssistTest (LocalScript)
+	Local: StarterPlayer > StarterPlayerScripts
+
+	Sistema de teste de mira assistida para o SEU próprio jogo, em ambiente de desenvolvimento.
+	Seções:
+	  1. Config
+	  2. State
+	  3. FovCalculator   - cálculo de posição na tela / distância ao centro
+	  4. TargetSelector  - escolha do alvo (players válidos dentro do FOV)
+	  5. CameraController - movimento suave da câmera
+	  6. ControlPanel    - interface (painel arrastável, sliders, círculo de FOV)
+	  7. Main            - liga tudo
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+--------------------------------------------------------------------------------
+-- 1. CONFIG
+--------------------------------------------------------------------------------
+local Config = {
+	-- FOV
+	MinRadius = 40,
+	MaxRadius = 400,
+	DefaultRadius = 140,
+
+	-- Suavidade (0 = rápido, 1 = bem suave)
+	DefaultSmoothness = 0.6,
+	FastSpeed = 30,  -- velocidade de acompanhamento com suavidade 0
+	SlowSpeed = 3,   -- velocidade de acompanhamento com suavidade 1
+	MaxTurnDegPerSecond = 900, -- limite de giro para evitar mudanças bruscas
+	DeadzoneDeg = 0.15,        -- abaixo disso a câmera não se mexe (evita tremor)
+
+	-- Seleção
+	WallCheck = true,        -- só mira em alvos sem parede no caminho
+	IgnoreTeammates = false, -- ignora jogadores do mesmo time
+	SwitchThreshold = 0.75,  -- histerese: só troca de alvo se o novo estiver bem mais perto do centro
+
+	-- Controles
+	ToggleKey = Enum.KeyCode.Q, -- atalho no PC (no celular use o botão)
+
+	-- UI
+	PanelWidth = 230,
+}
+
+--------------------------------------------------------------------------------
+-- 2. STATE
+--------------------------------------------------------------------------------
+local State = {
+	AimEnabled = false,
+	FovEnabled = true,
+	Radius = Config.DefaultRadius,
+	Smoothness = Config.DefaultSmoothness,
+	PartIndex = 1,
+	Target = nil,     -- Player
+	TargetPart = nil, -- BasePart
+}
+
+--------------------------------------------------------------------------------
+-- 3. FOV CALCULATOR
+--------------------------------------------------------------------------------
+local FovCalculator = {}
+
+-- Retorna a posição 2D (em pixels) de um ponto do mundo, ou nil se estiver fora da tela / atrás da câmera.
+function FovCalculator.screenPosition(camera, worldPosition)
+	local point, onScreen = camera:WorldToViewportPoint(worldPosition)
+	if not onScreen or point.Z <= 0 then
+		return nil
+	end
+	return Vector2.new(point.X, point.Y)
+end
+
+-- Distância (pixels) do ponto até o centro da tela, ou nil se não estiver visível.
+function FovCalculator.distanceFromCenter(camera, worldPosition)
+	local screenPos = FovCalculator.screenPosition(camera, worldPosition)
+	if not screenPos then
+		return nil
+	end
+	local center = camera.ViewportSize / 2
+	return (screenPos - center).Magnitude
+end
+
+--------------------------------------------------------------------------------
+-- 4. TARGET SELECTOR
+--------------------------------------------------------------------------------
+local TargetSelector = {}
+
+TargetSelector.PartOptions = {
+	{ Label = "Cabeça", Names = { "Head" } },
+	{ Label = "Tronco", Names = { "UpperTorso", "Torso" } },
+	{ Label = "Centro", Names = { "HumanoidRootPart" } },
+}
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function isAlive(character)
+	if not character or not character:IsDescendantOf(Workspace) then
+		return false
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	return humanoid ~= nil and humanoid.Health > 0
+end
+
+local function getAimPart(character, optionIndex)
+	local option = TargetSelector.PartOptions[optionIndex]
+	if option then
+		for _, name in option.Names do
+			local part = character:FindFirstChild(name)
+			if part and part:IsA("BasePart") then
+				return part
+			end
+		end
+	end
+	-- fallback: cabeça, depois raiz
+	local head = character:FindFirstChild("Head")
+	if head and head:IsA("BasePart") then
+		return head
+	end
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if root and root:IsA("BasePart") then
+		return root
+	end
+	return nil
+end
+
+local function isVisible(camera, part, character)
+	rayParams.FilterDescendantsInstances = { LocalPlayer.Character }
+	local origin = camera.CFrame.Position
+	local result = Workspace:Raycast(origin, part.Position - origin, rayParams)
+	return result == nil or result.Instance:IsDescendantOf(character)
+end
+
+-- Procura o melhor alvo. Mantém o alvo atual enquanto ele for válido e não houver outro bem mais próximo do centro.
+function TargetSelector.findBest(camera, currentPlayer, state)
+	local limit = state.FovEnabled and state.Radius or math.huge
+
+	local bestPlayer, bestPart, bestDist
+	local currentPart, currentDist
+
+	for _, player in Players:GetPlayers() do
+		if player ~= LocalPlayer then
+			local skip = Config.IgnoreTeammates and player.Team ~= nil and player.Team == LocalPlayer.Team
+			local character = player.Character
+			if not skip and isAlive(character) then
+				local part = getAimPart(character, state.PartIndex)
+				if part and part:IsDescendantOf(Workspace) then
+					local dist = FovCalculator.distanceFromCenter(camera, part.Position)
+					if dist and dist <= limit and (not Config.WallCheck or isVisible(camera, part, character)) then
+						if player == currentPlayer then
+							currentPart, currentDist = part, dist
+						end
+						if not bestDist or dist < bestDist then
+							bestPlayer, bestPart, bestDist = player, part, dist
+						end
+					end
+				end
+			end
+		end
+	end
+
+	-- histerese para não ficar alternando entre alvos parecidos
+	if currentPart and bestPlayer ~= currentPlayer and bestDist >= currentDist * Config.SwitchThreshold then
+		return currentPlayer, currentPart
+	end
+	return bestPlayer, bestPart
+end
+
+--------------------------------------------------------------------------------
+-- 5. CAMERA CONTROLLER
+--------------------------------------------------------------------------------
+local CameraController = {}
+
+local BIND_NAME = "AimAssistTestCamera"
+local bound = false
+
+function CameraController.bind(stepFunction)
+	if bound then
+		return
+	end
+	bound = true
+	-- Roda logo depois do script de câmera padrão do Roblox.
+	RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 1, stepFunction)
+end
+
+-- Desfaz o bind: o controle normal da câmera volta no mesmo instante (não alteramos CameraType).
+function CameraController.unbind()
+	if not bound then
+		return
+	end
+	bound = false
+	RunService:UnbindFromRenderStep(BIND_NAME)
+end
+
+-- Gira a câmera em direção a um ponto com suavização exponencial (independente de FPS, sem overshoot).
+function CameraController.aimAt(camera, targetPosition, dt, smoothness)
+	local current = camera.CFrame
+	local toTarget = targetPosition - current.Position
+	if toTarget.Magnitude < 0.1 then
+		return
+	end
+
+	local desired = CFrame.lookAt(current.Position, targetPosition)
+	local cosAngle = math.clamp(current.LookVector:Dot(desired.LookVector), -1, 1)
+	local angle = math.acos(cosAngle)
+
+	if angle < math.rad(Config.DeadzoneDeg) then
+		return
+	end
+
+	local speed = Config.FastSpeed + (Config.SlowSpeed - Config.FastSpeed) * smoothness
+	local alpha = 1 - math.exp(-speed * dt)
+
+	-- limita a velocidade angular máxima
+	local maxStep = math.rad(Config.MaxTurnDegPerSecond) * dt
+	alpha = math.min(alpha, maxStep / angle, 1)
+
+	camera.CFrame = current:Lerp(desired, alpha)
+end
+
+--------------------------------------------------------------------------------
+-- 6. CONTROL PANEL (UI)
+--------------------------------------------------------------------------------
+local ControlPanel = {}
+
+local COLORS = {
+	Panel = Color3.fromRGB(24, 26, 33),
+	Header = Color3.fromRGB(36, 39, 50),
+	Off = Color3.fromRGB(70, 74, 88),
+	On = Color3.fromRGB(46, 160, 90),
+	Accent = Color3.fromRGB(80, 140, 255),
+	Track = Color3.fromRGB(55, 58, 70),
+	Text = Color3.fromRGB(235, 237, 245),
+	SubText = Color3.fromRGB(170, 175, 190),
+	Circle = Color3.fromRGB(255, 255, 255),
+}
+
+local function make(className, props, parent)
+	local inst = Instance.new(className)
+	for key, value in props do
+		inst[key] = value
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local function addCorner(parent, radius)
+	return make("UICorner", { CornerRadius = UDim.new(0, radius) }, parent)
+end
+
+local function isPointerStart(input)
+	return input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function isPointerMove(dragInput, input)
+	if input == dragInput then
+		return true
+	end
+	return dragInput.UserInputType == Enum.UserInputType.MouseButton1
+		and input.UserInputType == Enum.UserInputType.MouseMovement
+end
+
+local function makeDraggable(handle, target, gui)
+	local dragInput, dragStart, startPos
+
+	handle.InputBegan:Connect(function(input)
+		if isPointerStart(input) then
+			dragInput = input
+			dragStart = input.Position
+			startPos = target.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End and dragInput == input then
+					dragInput = nil
+				end
+			end)
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if dragInput and isPointerMove(dragInput, input) then
+			local delta = input.Position - dragStart
+			local viewport = gui.AbsoluteSize
+			local size = target.AbsoluteSize
+			local x = math.clamp(startPos.X.Offset + delta.X, 0, math.max(viewport.X - size.X, 0))
+			local y = math.clamp(startPos.Y.Offset + delta.Y, 0, math.max(viewport.Y - size.Y, 0))
+			target.Position = UDim2.fromOffset(x, y)
+		end
+	end)
+end
+
+local function createToggle(parent, order, onClick)
+	local button = make("TextButton", {
+		Size = UDim2.new(1, 0, 0, 34),
+		LayoutOrder = order,
+		BackgroundColor3 = COLORS.Off,
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 14,
+		TextColor3 = COLORS.Text,
+		Text = "",
+		AutoButtonColor = true,
+	}, parent)
+	addCorner(button, 8)
+	button.Activated:Connect(onClick)
+	return button
+end
+
+local function setToggleVisual(button, label, isOn)
+	button.Text = label .. ": " .. (isOn and "ON" or "OFF")
+	button.BackgroundColor3 = isOn and COLORS.On or COLORS.Off
+end
+
+local function createSlider(parent, order, labelText, min, max, initial, step, formatter, onChanged)
+	local row = make("Frame", {
+		Size = UDim2.new(1, 0, 0, 44),
+		BackgroundTransparency = 1,
+		LayoutOrder = order,
+	}, parent)
+
+	local label = make("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 16),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextColor3 = COLORS.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "",
+	}, row)
+
+	-- área de toque maior que a barra visual (bom para celular)
+	local track = make("Frame", {
+		Position = UDim2.fromOffset(0, 20),
+		Size = UDim2.new(1, 0, 0, 24),
+		BackgroundTransparency = 1,
+		Active = true,
+	}, row)
+
+	local bar = make("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.new(1, 0, 0, 6),
+		BackgroundColor3 = COLORS.Track,
+		BorderSizePixel = 0,
+	}, track)
+	addCorner(bar, 3)
+
+	local fill = make("Frame", {
+		Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = COLORS.Accent,
+		BorderSizePixel = 0,
+	}, bar)
+	addCorner(fill, 3)
+
+	local knob = make("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.fromOffset(18, 18),
+		BackgroundColor3 = COLORS.Text,
+		BorderSizePixel = 0,
+	}, bar)
+	addCorner(knob, 9)
+
+	local function setValue(value, fire)
+		value = math.clamp(math.round(value / step) * step, min, max)
+		local alpha = (value - min) / (max - min)
+		fill.Size = UDim2.fromScale(alpha, 1)
+		knob.Position = UDim2.fromScale(alpha, 0.5)
+		label.Text = labelText .. ": " .. formatter(value)
+		if fire then
+			onChanged(value)
+		end
+	end
+
+	local function updateFromX(x)
+		local alpha = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+		setValue(min + (max - min) * alpha, true)
+	end
+
+	local dragInput
+	track.InputBegan:Connect(function(input)
+		if isPointerStart(input) then
+			dragInput = input
+			updateFromX(input.Position.X)
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End and dragInput == input then
+					dragInput = nil
+				end
+			end)
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if dragInput and isPointerMove(dragInput, input) then
+			updateFromX(input.Position.X)
+		end
+	end)
+
+	setValue(initial, false)
+end
+
+function ControlPanel.create(state, handlers)
+	local gui = make("ScreenGui", {
+		Name = "AimAssistTestGui",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true, -- mesmo sistema de coordenadas do WorldToViewportPoint
+		DisplayOrder = 50,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, PlayerGui)
+
+	-- Círculo de FOV (centralizado na tela, não bloqueia toques)
+	local circle = make("Frame", {
+		Name = "FovCircle",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(state.Radius * 2, state.Radius * 2),
+		BackgroundTransparency = 1,
+		Active = false,
+		Visible = state.FovEnabled,
+	}, gui)
+	make("UICorner", { CornerRadius = UDim.new(1, 0) }, circle)
+	make("UIStroke", { Color = COLORS.Circle, Thickness = 2, Transparency = 0.25 }, circle)
+
+	-- Painel
+	local panel = make("Frame", {
+		Name = "Panel",
+		Position = UDim2.fromOffset(12, 64),
+		Size = UDim2.fromOffset(Config.PanelWidth, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = COLORS.Panel,
+		BorderSizePixel = 0,
+	}, gui)
+	addCorner(panel, 10)
+	make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, panel)
+
+	local header = make("Frame", {
+		Size = UDim2.new(1, 0, 0, 32),
+		BackgroundColor3 = COLORS.Header,
+		BorderSizePixel = 0,
+		LayoutOrder = 1,
+		Active = true,
+	}, panel)
+	addCorner(header, 10)
+
+	make("TextLabel", {
+		Size = UDim2.new(1, -40, 1, 0),
+		Position = UDim2.fromOffset(10, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		TextColor3 = COLORS.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "Teste de Mira (arraste)",
+	}, header)
+
+	local minimize = make("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -4, 0.5, 0),
+		Size = UDim2.fromOffset(28, 26),
+		BackgroundColor3 = COLORS.Off,
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamBold,
+		TextSize = 16,
+		TextColor3 = COLORS.Text,
+		Text = "–",
+	}, header)
+	addCorner(minimize, 6)
+
+	local body = make("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = 2,
+	}, panel)
+	make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, body)
+	make("UIPadding", {
+		PaddingTop = UDim.new(0, 8),
+		PaddingBottom = UDim.new(0, 8),
+		PaddingLeft = UDim.new(0, 10),
+		PaddingRight = UDim.new(0, 10),
+	}, body)
+
+	minimize.Activated:Connect(function()
+		body.Visible = not body.Visible
+		minimize.Text = body.Visible and "–" or "+"
+	end)
+
+	makeDraggable(header, panel, gui)
+
+	-- Controles
+	local aimButton = createToggle(body, 1, handlers.onToggleAim)
+	local fovButton = createToggle(body, 2, handlers.onToggleFov)
+	local partButton = createToggle(body, 3, handlers.onCyclePart)
+
+	createSlider(body, 4, "Raio do FOV", Config.MinRadius, Config.MaxRadius, state.Radius, 1,
+		function(v) return string.format("%d px", v) end,
+		handlers.onRadiusChanged)
+
+	createSlider(body, 5, "Suavidade", 0, 1, state.Smoothness, 0.01,
+		function(v) return string.format("%d%%", math.round(v * 100)) end,
+		handlers.onSmoothnessChanged)
+
+	local statusLabel = make("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = 6,
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextColor3 = COLORS.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextWrapped = true,
+		Text = "",
+	}, body)
+
+	local api = {}
+
+	function api.refresh()
+		setToggleVisual(aimButton, "Aim Lock", state.AimEnabled)
+		setToggleVisual(fovButton, "FOV", state.FovEnabled)
+		partButton.Text = "Parte: " .. TargetSelector.PartOptions[state.PartIndex].Label
+		partButton.BackgroundColor3 = COLORS.Off
+		circle.Visible = state.FovEnabled
+		circle.Size = UDim2.fromOffset(state.Radius * 2, state.Radius * 2)
+	end
+
+	function api.setStatus(text)
+		statusLabel.Text = text
+	end
+
+	api.refresh()
+	return api
+end
+
+--------------------------------------------------------------------------------
+-- 7. MAIN
+--------------------------------------------------------------------------------
+local ui
+
+local function onRenderStep(dt)
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return
+	end
+
+	local player, part = TargetSelector.findBest(camera, State.Target, State)
+	State.Target, State.TargetPart = player, part
+
+	if part then
+		CameraController.aimAt(camera, part.Position, dt, State.Smoothness)
+	end
+end
+
+local function setAimEnabled(enabled)
+	if State.AimEnabled == enabled then
+		return
+	end
+	State.AimEnabled = enabled
+
+	if enabled then
+		CameraController.bind(onRenderStep)
+	else
+		-- restaura imediatamente o controle normal da câmera
+		CameraController.unbind()
+		State.Target, State.TargetPart = nil, nil
+	end
+
+	ui.refresh()
+end
+
+ui = ControlPanel.create(State, {
+	onToggleAim = function()
+		setAimEnabled(not State.AimEnabled)
+	end,
+	onToggleFov = function()
+		State.FovEnabled = not State.FovEnabled
+		ui.refresh()
+	end,
+	onCyclePart = function()
+		State.PartIndex = State.PartIndex % #TargetSelector.PartOptions + 1
+		ui.refresh()
+	end,
+	onRadiusChanged = function(value)
+		State.Radius = value
+		ui.refresh()
+	end,
+	onSmoothnessChanged = function(value)
+		State.Smoothness = value
+	end,
+})
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if not gameProcessed and input.KeyCode == Config.ToggleKey then
+		setAimEnabled(not State.AimEnabled)
+	end
+end)
+
+-- Atualiza o texto de estado (10x por segundo)
+local accumulator = 0
+RunService.Heartbeat:Connect(function(dt)
+	accumulator += dt
+	if accumulator < 0.1 then
+		return
+	end
+	accumulator = 0
+
+	local partLabel = TargetSelector.PartOptions[State.PartIndex].Label
+	if not State.AimEnabled then
+		ui.setStatus("Estado: Aim Lock desativado")
+	elseif State.Target then
+		ui.setStatus(string.format("Estado: ATIVO\nAlvo: %s (%s)", State.Target.DisplayName, partLabel))
+	else
+		ui.setStatus("Estado: ATIVO\nSem alvo válido no FOV")
+	end
+end)
+
+-- Se o alvo sair do jogo, solta imediatamente (o findBest também valida a cada frame)
+Players.PlayerRemoving:Connect(function(player)
+	if State.Target == player then
+		State.Target, State.TargetPart = nil, nil
+	end
+end)
